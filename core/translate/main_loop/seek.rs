@@ -51,7 +51,12 @@ fn encode_seek_keys_for_custom_types(
         else {
             continue;
         };
-        if resolved.chain.iter().all(|td| td.encode().is_none()) {
+        // A scan compares the key with the decoded column value. When DECODE
+        // returns the stored value unchanged, the key is compared as it is,
+        // so the seek must not encode it either.
+        if resolved.reads_stored_values_unchanged()
+            || resolved.chain.iter().all(|td| td.encode().is_none())
+        {
             continue;
         }
         let reg = start_reg + i;
