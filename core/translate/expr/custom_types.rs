@@ -216,13 +216,7 @@ pub(super) fn find_custom_type_operator(
         }
 
         // Derive missing operators from < and =
-        let find_op = |sym: &str| -> Option<String> {
-            type_def
-                .operators()
-                .iter()
-                .find(|o| o.op == sym)
-                .and_then(|o| o.func_name.clone())
-        };
+        let find_op = |sym: &str| type_def.operator_func(sym).cloned();
 
         match *op {
             // a > b  →  lt(b, a)
@@ -299,6 +293,66 @@ fn operand_custom_type(
         }
     }
     column_custom_type(expr, env)
+}
+
+/// Return the type when `lhs` and `rhs` are columns of the same custom type
+/// declared with different parameters, such as `numeric(10,2)` and
+/// `numeric(10,3)`. Their values are encoded and decoded with different
+/// parameters, so equal values can have different bytes (`1.00` and `1.000`),
+/// and encoding one column's value with the other column's parameters can
+/// change it (`1.25` becomes `1.2`).
+pub(crate) fn custom_type_with_different_params(
+    lhs: &ast::Expr,
+    lhs_tables: &TableReferences,
+    rhs: &ast::Expr,
+    rhs_tables: &TableReferences,
+    schema: &Schema,
+) -> Option<Arc<TypeDef>> {
+    let lhs_info = table_column_custom_type(lhs, lhs_tables, schema)?;
+    let rhs_info = table_column_custom_type(rhs, rhs_tables, schema)?;
+    (same_type_def(&lhs_info.type_def, &rhs_info.type_def) && lhs_info.params != rhs_info.params)
+        .then_some(lhs_info.type_def)
+}
+
+/// Return the `=` function of the type when `lhs` and `rhs` are columns of the
+/// same custom type whose equal values can have different bytes, so a byte
+/// comparison misses matches that the `=` function finds. This is the case
+/// for a user-defined `=` function, such as one that finds `'1'` equal to
+/// `'01'`, and for columns declared with different parameters (see
+/// [custom_type_with_different_params]). The `=` function of a built-in type
+/// finds two values equal only when they have the same bytes under the same
+/// parameters, and a type without an `=` function compares bytes anyway.
+pub(crate) fn custom_type_eq_func_for_column_pair(
+    lhs: &ast::Expr,
+    lhs_tables: &TableReferences,
+    rhs: &ast::Expr,
+    rhs_tables: &TableReferences,
+    schema: &Schema,
+) -> Option<String> {
+    let lhs_info = table_column_custom_type(lhs, lhs_tables, schema)?;
+    let rhs_info = table_column_custom_type(rhs, rhs_tables, schema)?;
+    if !same_type_def(&lhs_info.type_def, &rhs_info.type_def) {
+        return None;
+    }
+    let eq_func = lhs_info.type_def.operator_func("=")?;
+    let equal_values_have_equal_bytes =
+        lhs_info.type_def.is_builtin && lhs_info.params == rhs_info.params;
+    (!equal_values_have_equal_bytes).then(|| eq_func.clone())
+}
+
+fn table_column_custom_type(
+    expr: &ast::Expr,
+    tables: &TableReferences,
+    schema: &Schema,
+) -> Option<ColumnCustomType> {
+    let ast::Expr::Column { table, column, .. } = expr else {
+        return None;
+    };
+    let (_, table) = tables.find_table_by_internal_id(*table)?;
+    match column_type(table.get_column_at(*column)?, table.is_strict(), schema) {
+        ExprType::Custom { type_def, params } => Some(ColumnCustomType { type_def, params }),
+        _ => None,
+    }
 }
 
 /// Evaluate an expression-index expression in a DML context (INSERT/UPDATE/UPSERT).
