@@ -7758,7 +7758,31 @@ fn update_agg_payload(
             *ovrfl_i = sum_state.ovrfl as i64;
         }
         AggFunc::Min | AggFunc::Max => {
-            update_min_max_payload(func, arg, payload, collation, comparator)?;
+            if matches!(arg, Value::Null) {
+                return Ok(());
+            }
+            if matches!(payload[0], Value::Null) {
+                payload[0].try_clone_from(arg)?;
+                return Ok(());
+            }
+            use std::cmp::Ordering;
+            let comparator = comparator()?;
+            // Use custom type comparator if available, otherwise fall back to collation
+            let cmp = if let Some(ref cmp_fn) = comparator {
+                let arg_ref = arg.as_ref();
+                let payload_ref = payload[0].as_ref();
+                cmp_fn(&arg_ref, &payload_ref)?
+            } else {
+                compare_with_collation(arg, &payload[0], Some(collation), &comparator)?
+            };
+            let should_update = match func {
+                AggFunc::Max => cmp == Ordering::Greater,
+                AggFunc::Min => cmp == Ordering::Less,
+                _ => false,
+            };
+            if should_update {
+                payload[0].try_clone_from(arg)?;
+            }
         }
         AggFunc::GroupConcat | AggFunc::StringAgg => {
             if matches!(arg, Value::Null) {
@@ -7922,46 +7946,6 @@ fn update_agg_payload(
         }
     }
     Ok(())
-}
-
-/// Steps a MIN/MAX aggregate. Returns false when the aggregate keeps its current
-/// value, and true when it stores `arg` or still has no value, the rows that
-/// SQLite reads the query's non-aggregate columns from.
-fn update_min_max_payload(
-    func: &AggFunc,
-    arg: &Value,
-    payload: &mut [Value],
-    collation: CollationSeq,
-    comparator: impl FnOnce() -> Result<Option<crate::vdbe::sorter::SortComparator>>,
-) -> Result<bool> {
-    if matches!(payload[0], Value::Null) {
-        if !matches!(arg, Value::Null) {
-            payload[0].try_clone_from(arg)?;
-        }
-        return Ok(true);
-    }
-    if matches!(arg, Value::Null) {
-        return Ok(false);
-    }
-    use std::cmp::Ordering;
-    let comparator = comparator()?;
-    // Use custom type comparator if available, otherwise fall back to collation
-    let cmp = if let Some(ref cmp_fn) = comparator {
-        let arg_ref = arg.as_ref();
-        let payload_ref = payload[0].as_ref();
-        cmp_fn(&arg_ref, &payload_ref)?
-    } else {
-        compare_with_collation(arg, &payload[0], Some(collation), &comparator)?
-    };
-    let should_update = match func {
-        AggFunc::Max => cmp == Ordering::Greater,
-        AggFunc::Min => cmp == Ordering::Less,
-        _ => unreachable!("update_min_max_payload called for {func:?}"),
-    };
-    if should_update {
-        payload[0].try_clone_from(arg)?;
-    }
-    Ok(should_update)
 }
 
 /// Max limit of aggregate Vecs we keep around to reuse their allocations. This is a very naive
@@ -9535,10 +9519,6 @@ pub fn op_agg_step(
                             if better {
                                 *best = arg;
                             }
-                            if let Some(changed_reg) = data.changed_reg {
-                                state.registers[changed_reg]
-                                    .set_value(Value::from_i64(i64::from(better)));
-                            }
                             state.pc += 1;
                             return Ok(InsnFunctionStepResult::Step);
                         }
@@ -9560,7 +9540,6 @@ fn op_agg_step_slow(program: &Program, state: &mut ProgramState, data: &AggStepD
         func,
         comparator,
         collation,
-        changed_reg,
     } = data;
 
     if let AccumulatorFunc::Window(win_func) = func {
@@ -9661,26 +9640,14 @@ fn op_agg_step_slow(program: &Program, state: &mut ProgramState, data: &AggStepD
                 .into());
             };
             let payload = agg.payload_vec_mut();
-            match changed_reg {
-                Some(changed_reg) => {
-                    let changed = update_min_max_payload(
-                        func,
-                        arg,
-                        payload,
-                        current_collation,
-                        comparator_factory,
-                    )?;
-                    state.registers[*changed_reg].set_value(Value::from_i64(i64::from(changed)));
-                }
-                None => update_agg_payload(
-                    func,
-                    arg,
-                    maybe_arg2.as_ref(),
-                    payload,
-                    current_collation,
-                    comparator_factory,
-                )?,
-            }
+            update_agg_payload(
+                func,
+                arg,
+                maybe_arg2.as_ref(),
+                payload,
+                current_collation,
+                comparator_factory,
+            )?;
         }
     };
 

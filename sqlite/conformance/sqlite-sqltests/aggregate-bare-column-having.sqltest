@@ -267,3 +267,53 @@ test having-bare-column-is-not-null-skips-min-row {
 }
 expect {
 }
+
+@setup null-in-min-row
+test having-bare-column-reads-max-row-not-first-row {
+    SELECT max(y) FROM t HAVING x = 1;
+}
+expect {
+}
+
+# A MIN/MAX step that keeps its value does not read the row: a tie, a NULL
+# argument, or a value equal under the collation. Like SQLite, a DISTINCT
+# duplicate skips the step, so the row is read if the previous row was.
+setup kept-value-rows {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, x INT, y, z TEXT);
+    INSERT INTO t VALUES (1, 1, 100, 'b'), (2, 2, 300, 'A'), (3, 3, 300, 'a'), (4, 4, NULL, 'B');
+}
+
+@setup kept-value-rows
+test max-tie-reads-first-max-row {
+    SELECT x, max(y) FROM t HAVING max(y) > 0;
+}
+expect {
+    2|300
+}
+
+@setup kept-value-rows
+test max-distinct-duplicate-reads-row-after-max-row {
+    SELECT x, max(DISTINCT y) FROM t HAVING x > 0;
+}
+expect {
+    3|300
+}
+
+@setup kept-value-rows
+test max-nocase-equal-value-does-not-read-row {
+    SELECT x, max(z COLLATE NOCASE) FROM t;
+}
+expect {
+    1|b
+}
+
+@setup kept-value-rows
+test correlated-max-reads-max-row-per-outer-row {
+    SELECT o.id, (SELECT t.x || '-' || max(t.y) FROM t WHERE t.id <= o.id) FROM t o ORDER BY o.id;
+}
+expect {
+    1|1-100
+    2|2-300
+    3|2-300
+    4|2-300
+}
