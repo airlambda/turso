@@ -1031,6 +1031,50 @@ pub struct SequenceInnerTxState {
     )>,
 }
 
+/// What a write statement's activity is measured against to tell whether it
+/// wrote anything before failing. In WAL mode the pager's dirty counter
+/// works: the pager and its counter are per-connection, so nothing else —
+/// not even a parallel passive checkpoint — advances it under a statement.
+/// In MVCC mode statements write to the transaction's own row store and the
+/// pager is only written by checkpoint work, so the baseline is the
+/// transaction's write-set size instead.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum WriteBaseline {
+    None,
+    PagerDirties(u64),
+    MvccWriteSet(usize),
+}
+
+impl WriteBaseline {
+    /// The main database's write activity right now, as seen by the
+    /// statement's connection.
+    pub(crate) fn capture(
+        mv_store: Option<&MvStore>,
+        connection: &Connection,
+        pager: &Pager,
+    ) -> WriteBaseline {
+        match mv_store {
+            Some(mv_store) => connection
+                .get_mv_tx_id()
+                .and_then(|tx_id| mv_store.tx_write_set_len(tx_id))
+                .map_or(WriteBaseline::None, WriteBaseline::MvccWriteSet),
+            None => WriteBaseline::PagerDirties(pager.pages_dirtied_count()),
+        }
+    }
+
+    /// Whether the statement wrote anything since this baseline was captured.
+    fn advanced(self, mv_store: Option<&MvStore>, connection: &Connection, pager: &Pager) -> bool {
+        match self {
+            WriteBaseline::None => false,
+            WriteBaseline::PagerDirties(at_start) => pager.pages_dirtied_count() != at_start,
+            WriteBaseline::MvccWriteSet(at_start) => mv_store
+                .zip(connection.get_mv_tx_id())
+                .and_then(|(mv_store, tx_id)| mv_store.tx_write_set_len(tx_id))
+                .is_some_and(|now| now > at_start),
+        }
+    }
+}
+
 pub struct ProgramState {
     /// Instructions left before the next interrupt/progress check of
     /// normal_step; reloaded with `check_interval` each time it reaches zero.
@@ -1178,6 +1222,10 @@ pub struct ProgramState {
     uses_subjournal: bool,
     /// Whether this statement is an active write inside an explicit transaction.
     pub(crate) is_active_write: bool,
+    /// Write activity on the main database when this statement became an
+    /// active write; abort() compares against it to tell whether the
+    /// statement wrote anything before failing.
+    pub(crate) write_baseline: WriteBaseline,
     /// Whether begin_statement was called (savepoint + FK bookkeeping active).
     has_stmt_transaction: bool,
     pub n_change: AtomicI64,
@@ -1279,6 +1327,7 @@ impl ProgramState {
             ephemeral_temp_files: HashMap::default(),
             uses_subjournal: false,
             is_active_write: false,
+            write_baseline: WriteBaseline::None,
             has_stmt_transaction: false,
             attached_savepoint_pagers: Vec::new(),
             n_change: AtomicI64::new(0),
@@ -1451,6 +1500,7 @@ impl ProgramState {
         }
         self.uses_subjournal = false;
         self.is_active_write = false;
+        self.write_baseline = WriteBaseline::None;
         self.has_stmt_transaction = false;
         self.distinct_key_values.clear();
         self.attached_savepoint_pagers.clear();
@@ -3474,6 +3524,26 @@ impl Program {
             }
         }
 
+        /// Whether this failed statement, which has no statement savepoint,
+        /// forces the whole transaction to roll back. Ordinary runtime errors
+        /// (overflow, type errors, constraint checks, ...) are raised before
+        /// such a statement writes anything, so the transaction survives
+        /// them. The listed errors can strike mid-write, leaving partial
+        /// writes only a full rollback can undo; an I/O error rolls back even
+        /// from a read-only statement, because it may have hit a cache spill
+        /// of pages dirtied by earlier statements in the transaction. SQLite
+        /// applies the same rules to its "special errors" (sqlite3VdbeHalt).
+        fn error_forces_txn_rollback(err: &LimboError, unfinished_writer: bool) -> bool {
+            match err {
+                LimboError::CompletionError(_) => true,
+                LimboError::DatabaseFull
+                | LimboError::CacheError(_)
+                | LimboError::Corrupt(_)
+                | LimboError::Interrupt => unfinished_writer,
+                _ => false,
+            }
+        }
+
         let mut abort_error: Option<LimboError> = None;
         if let Err(err) = execute::abort_active_subprogram(self, state, err) {
             capture_abort_error(&mut abort_error, err, "Failed to abort active subprogram");
@@ -3845,7 +3915,13 @@ impl Program {
                         }
                     }
                     TxnCleanup::RollbackSavepoint => {
-                        if can_autocommit_now {
+                        // An I/O error invalidates more than the failing
+                        // statement — it may have hit a spill of pages other
+                        // statements dirtied — so the statement savepoint is
+                        // not enough: roll back the whole transaction, like
+                        // SQLite on SQLITE_IOERR.
+                        let io_error = matches!(err, Some(LimboError::CompletionError(_)));
+                        if can_autocommit_now || io_error {
                             self.rollback_current_txn(pager);
                         } else if err.is_none() && !pager.is_checkpointing() {
                             if let Err(end_stmt_err) = state.end_statement(
@@ -3862,9 +3938,42 @@ impl Program {
                         }
                     }
                     TxnCleanup::None => {
-                        if can_autocommit_now
-                            || (!self.connection.get_auto_commit() && err.is_some())
-                        {
+                        // An ordinary error, or a clean drop (err == None),
+                        // keeps the transaction: ordinary errors fail before
+                        // writing, and a dropped unfinished writer was poisoned
+                        // above so the caller must ROLLBACK explicitly.
+                        let forces_rollback = err
+                            .is_some_and(|err| error_forces_txn_rollback(err, unfinished_writer));
+                        // Ordinary errors must be raised before a statement
+                        // without a statement savepoint writes anything. A
+                        // violation means a statement shape is missing from the
+                        // savepoint analysis in translate/stmt_journal.rs or an
+                        // error is missing from error_can_strike_mid_write:
+                        // fail loudly in debug builds, and roll the transaction
+                        // back rather than keep its partial writes. SQLite
+                        // asserts the same invariant
+                        // (sqlite3VdbeAssertAbortable).
+                        let wrote_without_savepoint = !can_autocommit_now
+                            && unfinished_writer
+                            && err.is_some()
+                            && !forces_rollback
+                            && {
+                                let baseline = state.write_baseline;
+                                let mv_store = state.mv_store(&self.connection).cloned();
+                                baseline.advanced(mv_store.as_deref(), &self.connection, pager)
+                            };
+                        if wrote_without_savepoint {
+                            tracing::error!(
+                                "statement wrote, then failed without a \
+                                 statement savepoint: {err:?}"
+                            );
+                            debug_assert!(
+                                false,
+                                "statement wrote, then failed without a \
+                                 statement savepoint: {err:?}"
+                            );
+                        }
+                        if can_autocommit_now || forces_rollback || wrote_without_savepoint {
                             self.rollback_current_txn(pager);
                         }
                     }
