@@ -15151,7 +15151,8 @@ pub fn op_drop_table(
             schema.remove_indices_for_table(*namespace, table_name);
             schema.remove_triggers_for_table(*namespace, table_name);
             schema.remove_table(*namespace, table_name);
-        })?;
+            schema.refresh_view_columns(*db)
+        })??;
         // SQLite also removes temp triggers that target the dropped table.
         // Only needed when dropping from a non-temp database. We must
         // scope the removal to triggers whose `target_database_id`
@@ -15190,7 +15191,8 @@ pub fn op_drop_view(
     conn.with_database_schema_mut(*db, |schema| {
         schema.remove_view(*namespace, view_name).ok();
         schema.remove_broken_view(*namespace, view_name);
-    })?;
+        schema.refresh_view_columns(*db)
+    })??;
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -16160,15 +16162,17 @@ fn op_parse_schema_step(state: &mut ProgramState, conn: &Arc<Connection>) -> Ins
                 let mv_store = stmt.mv_store();
                 let syms = conn.syms.read();
 
-                let populate_result = schema.populate_materialized_views_then_indices(
-                    &syms,
-                    materialized_view_info,
-                    dbsp_state_roots,
-                    dbsp_state_index_roots,
-                    from_sql_indexes,
-                    automatic_indices,
-                    mv_store.is_some(),
-                );
+                let populate_result = schema
+                    .populate_materialized_views_then_indices(
+                        &syms,
+                        materialized_view_info,
+                        dbsp_state_roots,
+                        dbsp_state_index_roots,
+                        from_sql_indexes,
+                        automatic_indices,
+                        mv_store.is_some(),
+                    )
+                    .and_then(|()| schema.refresh_view_columns(db));
 
                 // Store the modified schema back
                 if db == crate::TEMP_DB_ID {
@@ -18003,7 +18007,7 @@ pub fn op_drop_column(
         });
 
         btree.shift_generated_column_indices_after_drop(*column_index)?;
-        Ok(())
+        schema.refresh_view_columns(*db)
     })??;
 
     conn.with_schema(*db, |schema| -> crate::Result<()> {
@@ -18114,7 +18118,7 @@ pub fn op_add_column(
 
         // Resolve generated column expressions and update virtual column metadata
         btree.prepare_generated_columns()?;
-        Ok(())
+        schema.refresh_view_columns(data.db)
     })??;
 
     state.pc += 1;
