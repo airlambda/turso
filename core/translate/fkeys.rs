@@ -67,6 +67,15 @@ impl FkActionCompileStack {
             .map(|entry| entry.slot.clone())
     }
 
+    /// Whether the program being compiled is the action program of this
+    /// foreign key.
+    pub(super) fn is_compiling_action_of(&self, foreign_key: &Arc<ForeignKey>) -> bool {
+        self.0
+            .borrow()
+            .last()
+            .is_some_and(|entry| Arc::ptr_eq(&entry.foreign_key, foreign_key))
+    }
+
     /// Remember that a foreign-key action program is being compiled.
     ///
     /// The returned guard removes the entry from the stack when compilation
@@ -964,15 +973,17 @@ fn emit_fk_parent_key_probe(
     let child_tbl = &fk_ref.child_table;
     let child_cols = &fk_ref.fk.child_columns;
     let is_deferred = fk_ref.fk.deferred;
-    let is_restrict = matches!(fk_ref.fk.on_update, RefAct::Restrict);
+    let is_self_ref = child_tbl.name.eq_ignore_ascii_case(&fk_ref.fk.parent_table);
+    let is_restrict = matches!(fk_ref.fk.on_update, RefAct::Restrict)
+        && !resolver.dialect.checks_fk_restrict_after_statement();
     let skip_probe = program.allocate_label();
     emit_skip_if_any_null(program, parent_key_start, n_cols, skip_probe);
 
     let on_match = |p: &mut ProgramBuilder| -> Result<()> {
-        match (is_deferred, pass) {
+        match pass {
             // OLD key referenced by a child: removing/changing this parent key
             // creates a violation unless a later statement repairs it.
-            (_, ParentProbePass::Old) => {
+            ParentProbePass::Old => {
                 if is_restrict {
                     // RESTRICT: immediate halt
                     emit_fk_restrict_halt(p, None)?;
@@ -983,15 +994,17 @@ fn emit_fk_parent_key_probe(
             }
 
             // NEW key referenced by a child: this parent key may repair a
-            // deferred orphan. The decrement is guarded because the aggregate
-            // counter does not know which key originally incremented it.
-            (true, ParentProbePass::New) => {
+            // deferred orphan, or for a self-reference an orphan that an
+            // earlier row of this statement counted. The decrement is guarded
+            // because the aggregate counter does not know which key originally
+            // incremented it.
+            ParentProbePass::New if is_deferred || is_self_ref => {
                 let skip = p.allocate_label();
-                emit_guarded_fk_decrement(p, skip, fk_ref.fk.deferred);
+                emit_guarded_fk_decrement(p, skip, is_deferred);
                 p.preassign_label_to_next_insn(skip);
             }
-            // Immediate FK on NEW pass: nothing to cancel; do nothing.
-            (false, ParentProbePass::New) => {}
+            // Immediate FK from another table on NEW pass: nothing to cancel.
+            ParentProbePass::New => {}
         }
         Ok(())
     };
@@ -1108,7 +1121,7 @@ fn build_parent_key(
 
 /// Child-side FK maintenance for UPDATE/UPSERT:
 /// If any FK columns of this child row changed:
-///  Pass 1 (OLD tuple): if OLD is non-NULL and parent is missing: decrement deferred counter (guarded).
+///  Pass 1 (OLD tuple): if OLD is non-NULL and parent is missing: decrement the FK counter (guarded).
 ///  Pass 2 (NEW tuple): if NEW is non-NULL and parent is missing: immediate error or deferred(+1).
 #[allow(clippy::too_many_arguments)]
 pub fn emit_fk_child_update_counters(
@@ -1181,8 +1194,12 @@ pub fn emit_fk_child_update_counters(
 
         let ncols = fk_ref.fk.child_columns.len();
 
-        // Pass 1: OLD tuple handling only for deferred FKs
-        if fk_ref.fk.deferred {
+        // Pass 1: OLD tuple handling. The action program of this FK skips it:
+        // the parent change that ran the action counted no violation.
+        if !resolver
+            .fk_action_compile_stack
+            .is_compiling_action_of(&fk_ref.fk)
+        {
             if let Some((dml_ctx, fk_col_positions, null_skip)) =
                 load_old_fk_values(program, &fk_ref.fk.child_columns)?
             {
@@ -1504,7 +1521,8 @@ fn emit_fk_delete_parent_existence_check_single(
         .name
         .eq_ignore_ascii_case(parent_table_name);
 
-    let is_restrict = matches!(fk_ref.fk.on_delete, RefAct::Restrict);
+    let is_restrict = matches!(fk_ref.fk.on_delete, RefAct::Restrict)
+        && !resolver.dialect.checks_fk_restrict_after_statement();
 
     // Build parent key in FK's parent-column order
     let parent_cols: &[String] = &fk_ref.parent_cols;
@@ -2532,10 +2550,17 @@ pub fn emit_fk_drop_table_check(
             LimboError::InternalError(format!("parent table {parent_table_name} not found"))
         })?;
 
-    // Get all FK references to this parent table
-    let fk_refs = resolver.with_schema(database_id, |s| {
+    // Get all FK references to this parent table. A table's references to
+    // itself are left out: its child rows are dropped along with their parents.
+    let mut fk_refs = resolver.with_schema(database_id, |s| {
         s.resolved_fks_referencing(namespace.id, parent_table_name)
     })?;
+    fk_refs.retain(|fk_ref| {
+        !fk_ref
+            .child_table
+            .name
+            .eq_ignore_ascii_case(parent_table_name)
+    });
 
     if fk_refs.is_empty() {
         return Ok(());

@@ -6288,6 +6288,37 @@ pub fn unqualified_create_table_name_location(parse_result: &ParseResult) -> Opt
     Some(relation.location as usize)
 }
 
+/// The tables that the foreign keys of a CREATE TABLE statement reference
+/// without naming a schema. PostgreSQL looks them up through `search_path`.
+pub fn unqualified_foreign_key_tables(parse_result: &ParseResult) -> Vec<String> {
+    use pg_query::protobuf::node::Node;
+
+    let Some(Node::CreateStmt(create)) = parse_result
+        .protobuf
+        .stmts
+        .first()
+        .and_then(|stmt| stmt.stmt.as_ref())
+        .and_then(|stmt| stmt.node.as_ref())
+    else {
+        return Vec::new();
+    };
+    let column_constraints = create.table_elts.iter().flat_map(|elt| match &elt.node {
+        Some(Node::ColumnDef(column)) => column.constraints.iter().collect(),
+        _ => Vec::new(),
+    });
+    create
+        .table_elts
+        .iter()
+        .chain(column_constraints)
+        .filter_map(|node| match &node.node {
+            Some(Node::Constraint(constraint)) => constraint.pktable.as_ref(),
+            _ => None,
+        })
+        .filter(|table| table.schemaname.is_empty() && table.catalogname.is_empty())
+        .map(|table| table.relname.clone())
+        .collect()
+}
+
 /// For a CREATE INDEX statement without an index name, the name PostgreSQL
 /// chooses and the byte offset of the `ON` keyword, where the name goes in
 /// the statement text. The name is `<table>_<columns>_idx`, with a number
@@ -6580,6 +6611,17 @@ pub fn is_drop_matview(parse_result: &ParseResult) -> bool {
         &nodes[0].0,
         NodeRef::DropStmt(drop) if drop.remove_type == ObjectType::ObjectMatview as i32
     )
+}
+
+/// Returns true if the parse result is a TRUNCATE statement.
+pub fn is_truncate(parse_result: &ParseResult) -> bool {
+    use pg_query::NodeRef;
+
+    let nodes = parse_result.protobuf.nodes();
+    if nodes.is_empty() {
+        return false;
+    }
+    matches!(&nodes[0].0, NodeRef::TruncateStmt(_))
 }
 
 /// Returns true if the parse result is a COMMENT ON statement.

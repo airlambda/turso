@@ -17,10 +17,11 @@ use turso_pg_parser::sqlstate::{
     SQLSTATE_OBJECT_NOT_IN_PREREQUISITE_STATE, SQLSTATE_RESERVED_NAME, SQLSTATE_WRONG_OBJECT_TYPE,
 };
 use turso_pg_parser::translator::{
-    check_set_transaction, is_comment_on, is_drop_matview, is_refresh_matview,
+    check_set_transaction, is_comment_on, is_drop_matview, is_refresh_matview, is_truncate,
     try_extract_copy_from, try_extract_create_schema, try_extract_drop_schema, try_extract_set,
-    try_extract_show, unnamed_index_name, unqualified_create_table_name_location, PgCopyFromStmt,
-    PgCreateSchemaStmt, PgDropSchemaStmt, PgSetStmt, PgSetValue, PgShowStmt, PostgreSQLTranslator,
+    try_extract_show, unnamed_index_name, unqualified_create_table_name_location,
+    unqualified_foreign_key_tables, PgCopyFromStmt, PgCreateSchemaStmt, PgDropSchemaStmt,
+    PgSetStmt, PgSetValue, PgShowStmt, PostgreSQLTranslator,
 };
 use turso_pg_parser::ParseError;
 
@@ -84,6 +85,7 @@ impl PgConnection {
             turso_core::MAIN_DB_ID,
         ));
         set_search_path(&conn, None, SettingScope::Session)?;
+        conn.set_foreign_keys_enabled(true);
         Ok(Self {
             inner: Arc::new(PgConnectionInner { conn }),
         })
@@ -224,8 +226,22 @@ fn prepare_statement(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<crat
         .translate_with_prereqs(&parse_result)
         .map_err(|e| translation_error(&pg_conn.conn, e))?;
     reject_catalog_dml(translated.cmd.stmt())?;
-    if let ast::Stmt::DropView { view_name, .. } = translated.cmd.stmt() {
-        reject_drop_of_other_view_kind(&pg_conn.conn, view_name, is_drop_matview(&parse_result))?;
+    match translated.cmd.stmt() {
+        ast::Stmt::DropView { view_name, .. } => reject_drop_of_other_view_kind(
+            &pg_conn.conn,
+            view_name,
+            is_drop_matview(&parse_result),
+        )?,
+        ast::Stmt::DropTable { tbl_name, .. } => {
+            reject_removal_of_referenced_table(&pg_conn.conn, tbl_name, false)?
+        }
+        ast::Stmt::Delete { tbl_name, .. } if is_truncate(&parse_result) => {
+            reject_removal_of_referenced_table(&pg_conn.conn, tbl_name, true)?
+        }
+        ast::Stmt::CreateTable { tbl_name, .. } => {
+            reject_foreign_key_into_other_schema(&pg_conn.conn, &parse_result, tbl_name)?
+        }
+        _ => {}
     }
 
     if translated.prereqs.is_empty() {
@@ -442,6 +458,102 @@ fn reject_drop_of_other_view_kind(
         return Ok(());
     }
     Ok(())
+}
+
+/// Rejects DROP TABLE and TRUNCATE of a table that another table references
+/// with a foreign key, like PostgreSQL. Core would instead delete or check the
+/// rows, running the ON DELETE actions of the referencing tables. A table
+/// referencing itself does not count, as in PostgreSQL.
+fn reject_removal_of_referenced_table(
+    conn: &Arc<Connection>,
+    tbl_name: &ast::QualifiedName,
+    truncate: bool,
+) -> Result<()> {
+    let schema = tbl_name.namespace.as_ref().map(|name| name.as_str());
+    let table = tbl_name.name.as_str();
+    let Some(database) = table_database(conn, schema, table)? else {
+        return Ok(());
+    };
+    let mut stmt = conn.prepare_sqlite(format!(
+        "SELECT 1 FROM \"{database}\".sqlite_schema child \
+         JOIN \"{database}\".pragma_foreign_key_list(child.name) fk \
+         WHERE child.type = 'table' AND child.name COLLATE NOCASE <> ?1 \
+           AND fk.\"table\" COLLATE NOCASE = ?1"
+    ))?;
+    stmt.bind_at(
+        NonZero::new(1).unwrap(),
+        Value::build_text(table.to_string()),
+    )?;
+    if stmt.run_collect_rows()?.is_empty() {
+        return Ok(());
+    }
+    Err(if truncate {
+        sqlstate_error(
+            SQLSTATE_FEATURE_NOT_SUPPORTED,
+            "cannot truncate a table referenced in a foreign key constraint",
+        )
+    } else {
+        sqlstate_error(
+            SQLSTATE_DEPENDENT_OBJECTS_STILL_EXIST,
+            match schema {
+                Some(_) if database != "main" => format!(
+                    "cannot drop table {database}.{table} because other objects depend on it"
+                ),
+                _ => format!("cannot drop table {table} because other objects depend on it"),
+            },
+        )
+    })
+}
+
+/// Rejects a foreign key of CREATE TABLE whose table, named without a schema,
+/// PostgreSQL finds through `search_path` in another schema than the new
+/// table's. Core looks up the referenced table only in the database of the
+/// referencing one.
+fn reject_foreign_key_into_other_schema(
+    conn: &Arc<Connection>,
+    parse_result: &turso_pg_parser::ParseResult,
+    tbl_name: &ast::QualifiedName,
+) -> Result<()> {
+    // Core creates a table named without a schema in the main database.
+    let Some(child_database) = (match &tbl_name.namespace {
+        Some(schema) => relation_lookup_databases(conn, Some(schema.as_str()))
+            .into_iter()
+            .next(),
+        None => Some("main".to_string()),
+    }) else {
+        return Ok(());
+    };
+    for parent in unqualified_foreign_key_tables(parse_result) {
+        if table_database(conn, None, &parent)?.is_some_and(|database| database != child_database) {
+            return Err(sqlstate_error(
+                SQLSTATE_FEATURE_NOT_SUPPORTED,
+                "foreign key referencing a table in another schema is not supported",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The database that table `table` is found in, looked up like core does.
+fn table_database(
+    conn: &Arc<Connection>,
+    schema: Option<&str>,
+    table: &str,
+) -> Result<Option<String>> {
+    for database in relation_lookup_databases(conn, schema) {
+        let mut stmt = conn.prepare_sqlite(format!(
+            "SELECT 1 FROM \"{database}\".sqlite_schema \
+             WHERE type = 'table' AND name COLLATE NOCASE = ?1"
+        ))?;
+        stmt.bind_at(
+            NonZero::new(1).unwrap(),
+            Value::build_text(table.to_string()),
+        )?;
+        if !stmt.run_collect_rows()?.is_empty() {
+            return Ok(Some(database));
+        }
+    }
+    Ok(None)
 }
 
 /// The databases that a relation is looked up in, in order. A relation
