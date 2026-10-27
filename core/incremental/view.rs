@@ -745,22 +745,40 @@ impl IncrementalView {
     /// before binding them. The executable DAG is still produced by the main
     /// bound planner; this walker is identity metadata only.
     ///
-    /// Each name comes with the database it is qualified with, if any.
+    /// Each name comes with the database it is qualified with, if any. A CTE
+    /// counts only when the SELECT reads it, as the planner skips unused CTEs.
     pub(crate) fn referenced_table_names(
         select: &ast::Select,
     ) -> std::vec::Vec<(Option<String>, String)> {
+        type Tables = HashSet<(Option<String>, String)>;
+        type CollectedCtes = HashSet<*const ast::CommonTableExpr>;
+
         fn collect_source(
             source: &ast::SelectTable,
-            cte_names: &HashSet<String>,
-            tables: &mut HashSet<(Option<String>, String)>,
+            ctes: &[&ast::With],
+            tables: &mut Tables,
+            collected_ctes: &mut CollectedCtes,
         ) {
             match source {
                 ast::SelectTable::Table(name, _, _) => {
-                    if cte_names
-                        .iter()
-                        .any(|cte| cte.eq_ignore_ascii_case(name.name.as_str()))
-                    {
-                        return;
+                    if name.namespace.is_none() {
+                        let table_name = crate::util::normalize_ident(name.name.as_str());
+                        // The CTE body sees its own WITH and the ones outside it.
+                        let cte = ctes.iter().enumerate().rev().find_map(|(depth, with)| {
+                            with.ctes
+                                .iter()
+                                .find(|cte| {
+                                    crate::util::normalize_ident(cte.tbl_name.as_str())
+                                        == table_name
+                                })
+                                .map(|cte| (cte, &ctes[..=depth]))
+                        });
+                        if let Some((cte, cte_scope)) = cte {
+                            if collected_ctes.insert(std::ptr::from_ref(cte)) {
+                                collect_select(&cte.select, cte_scope, tables, collected_ctes);
+                            }
+                            return;
+                        }
                     }
                     tables.insert((
                         name.namespace
@@ -770,12 +788,12 @@ impl IncrementalView {
                     ));
                 }
                 ast::SelectTable::Select { select, .. } => {
-                    collect_select(select, cte_names, tables)
+                    collect_select(select, ctes, tables, collected_ctes)
                 }
                 ast::SelectTable::Sub(from, _) => {
-                    collect_source(&from.select, cte_names, tables);
+                    collect_source(&from.select, ctes, tables, collected_ctes);
                     for join in &from.joins {
-                        collect_source(&join.table, cte_names, tables);
+                        collect_source(&join.table, ctes, tables, collected_ctes);
                     }
                 }
                 ast::SelectTable::TableCall(_, _, _) => {}
@@ -784,8 +802,9 @@ impl IncrementalView {
 
         fn collect_one(
             select: &ast::OneSelect,
-            cte_names: &HashSet<String>,
-            tables: &mut HashSet<(Option<String>, String)>,
+            ctes: &[&ast::With],
+            tables: &mut Tables,
+            collected_ctes: &mut CollectedCtes,
         ) {
             let ast::OneSelect::Select {
                 columns,
@@ -802,7 +821,7 @@ impl IncrementalView {
                 for source in std::iter::once(from.select.as_ref())
                     .chain(from.joins.iter().map(|join| join.table.as_ref()))
                 {
-                    collect_source(source, cte_names, tables);
+                    collect_source(source, ctes, tables, collected_ctes);
                 }
                 for join in &from.joins {
                     if let Some(ast::JoinConstraint::On(on)) = &join.constraint {
@@ -828,7 +847,7 @@ impl IncrementalView {
                         ast::Expr::Exists(select)
                         | ast::Expr::Subquery(select)
                         | ast::Expr::InSelect { rhs: select, .. } => {
-                            collect_select(select, cte_names, tables);
+                            collect_select(select, ctes, tables, collected_ctes);
                         }
                         _ => {}
                     }
@@ -840,25 +859,19 @@ impl IncrementalView {
 
         fn collect_select(
             select: &ast::Select,
-            inherited_ctes: &HashSet<String>,
-            tables: &mut HashSet<(Option<String>, String)>,
+            outer_ctes: &[&ast::With],
+            tables: &mut Tables,
+            collected_ctes: &mut CollectedCtes,
         ) {
-            let mut cte_names = inherited_ctes.clone();
-            if let Some(with) = &select.with {
-                for cte in &with.ctes {
-                    cte_names.insert(crate::util::normalize_ident(cte.tbl_name.as_str()));
-                }
-                for cte in &with.ctes {
-                    collect_select(&cte.select, &cte_names, tables);
-                }
-            }
-            collect_one(&select.body.select, &cte_names, tables);
+            let mut ctes = outer_ctes.to_vec();
+            ctes.extend(select.with.as_ref());
+            collect_one(&select.body.select, &ctes, tables, collected_ctes);
             for compound in &select.body.compounds {
-                collect_one(&compound.select, &cte_names, tables);
+                collect_one(&compound.select, &ctes, tables, collected_ctes);
             }
         }
         let mut tables = HashSet::default();
-        collect_select(select, &HashSet::default(), &mut tables);
+        collect_select(select, &[], &mut tables, &mut HashSet::default());
         tables.into_iter().collect()
     }
 }

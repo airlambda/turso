@@ -187,6 +187,19 @@ expect {
 }
 
 @skip-if mvcc "views not supported in MVCC mode"
+test alter-table-rename-column-fails-when-view-reads-dropped-table {
+    CREATE TABLE t (a);
+    CREATE TABLE u (a);
+    CREATE VIEW v AS SELECT a FROM t;
+    CREATE TRIGGER tr AFTER INSERT ON u BEGIN SELECT a FROM v; END;
+    DROP TABLE t;
+    ALTER TABLE u RENAME COLUMN a TO z;
+}
+expect error {
+    error in view v: no such table: main.t
+}
+
+@skip-if mvcc "views not supported in MVCC mode"
 test alter-table-rename-column-view-subquery {
     CREATE TABLE t (a, b);
     CREATE VIEW v AS SELECT a FROM t WHERE EXISTS (SELECT 1 FROM t WHERE t.b = 1);

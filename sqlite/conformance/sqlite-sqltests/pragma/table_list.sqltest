@@ -50,6 +50,19 @@ expect {
 }
 
 @cross-check-integrity
+test pragma-table-list-view-keeps-columns-when-unused-cte-reads-dropped-table {
+    CREATE TABLE t(a);
+    CREATE VIEW v AS WITH q AS (SELECT * FROM t) SELECT 1 AS one;
+    DROP TABLE t;
+    PRAGMA table_list('v');
+    SELECT name FROM pragma_table_info('v');
+}
+expect {
+    main|v|view|1|0|0
+    one
+}
+
+@cross-check-integrity
 test pragma-table-list-named-view-columns-follow-alter-and-drop-table {
     CREATE TABLE t(a, b);
     CREATE VIEW v AS SELECT * FROM t;

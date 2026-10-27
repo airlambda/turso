@@ -1927,6 +1927,7 @@ pub fn translate_alter_table(
                 // in the update list. This matches SQLite's approach and avoids
                 // incomplete detection heuristics that miss expression-level refs
                 // (e.g., `SELECT b FROM src` in a trigger on a different table).
+                reject_rename_with_unresolvable_view(resolver, namespace)?;
                 let target_table_name = normalize_ident(table_name);
                 for trigger_entry in collect_triggers_for_alter_target(resolver, namespace) {
                     if let Some(missing_table) = validate_trigger_table_refs_after_rename(
@@ -2294,6 +2295,38 @@ pub fn translate_alter_table(
     };
 
     Ok(())
+}
+
+/// Like SQLite, RENAME COLUMN fails when a view of the database cannot be
+/// resolved. Such a view has no columns (see `Schema::refresh_view_columns`),
+/// so a trigger that reads it would otherwise have its columns resolved
+/// against the wrong table and renamed.
+fn reject_rename_with_unresolvable_view(
+    resolver: &Resolver,
+    namespace: NamespaceRef,
+) -> Result<()> {
+    let database_name = resolver.namespace_name(namespace.database_id);
+    resolver.with_schema(namespace.database_id, |s| {
+        let Some((view_name, view)) = s
+            .views(namespace.id)
+            .find(|(_, view)| view.columns.is_empty())
+        else {
+            return Ok(());
+        };
+        let missing_table =
+            crate::incremental::view::IncrementalView::referenced_table_names(&view.select_stmt)
+                .into_iter()
+                .find(|(_, name)| {
+                    s.get_table(namespace.id, name).is_none()
+                        && s.get_view(namespace.id, name).is_none()
+                });
+        match (missing_table, database_name) {
+            (Some((_, table_name)), Some(database_name)) => crate::bail_parse_error!(
+                "error in view {view_name}: no such table: {database_name}.{table_name}"
+            ),
+            _ => crate::bail_parse_error!("error in view {view_name}"),
+        }
+    })
 }
 
 /// Reject ALTER TABLE on a plain or materialized view with SQLite's messages
