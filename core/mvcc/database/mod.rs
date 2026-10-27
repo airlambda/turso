@@ -498,6 +498,13 @@ pub enum RowVersionState {
     NotFound,
     Deleted,
 }
+
+pub(crate) enum VisibleRow {
+    Cell,
+    Version(crate::alloc::ArcSlice<u8>),
+    NoRow,
+}
+
 pub type TxID = u64;
 
 /// A log record contains all durable effects of a committed transaction,
@@ -1055,6 +1062,7 @@ pub struct Transaction<A: RowVersionAllocator = TursoAllocator> {
     /// Table and index ids this transaction allocated with `CreateBtree`. No other
     /// transaction can see these objects, so rollback drops their row maps whole.
     created_table_ids: Mutex<Vec<MVTableId>>,
+    table_writes: Arc<[AtomicU64; TABLE_WRITE_COUNTS]>,
 }
 
 impl<A: RowVersionAllocator> Transaction<A> {
@@ -1082,6 +1090,7 @@ impl<A: RowVersionAllocator> Transaction<A> {
             commit_dep_set: Mutex::new(HashSet::default()),
             holds_blocking_checkpoint_read: AtomicBool::new(false),
             created_table_ids: Mutex::new(Vec::new()),
+            table_writes: Arc::new(std::array::from_fn(|_| AtomicU64::new(0))),
         }
     }
 
@@ -1091,6 +1100,9 @@ impl<A: RowVersionAllocator> Transaction<A> {
             TransactionState::Active,
             "write set cannot be modified unless transaction is active"
         );
+        if matches!(id.row_id, RowKey::Int(_)) {
+            self.table_writes[table_write_index(id.table_id)].fetch_add(1, Ordering::Release);
+        }
         // Always record in the current savepoint's `newly_added_to_write_set`.
         // Duplicates here are harmless: `rollback_savepoint_changes` collects
         // touched rowids into a BTreeSet (dedup), and the actual write_set
@@ -1318,6 +1330,23 @@ impl<A: RowVersionAllocator> Transaction<A> {
             );
             savepoint.deleted_index_versions.push((key, version_id));
         }
+    }
+}
+
+const TABLE_WRITE_COUNTS: usize = 16;
+
+fn table_write_index(table_id: MVTableId) -> usize {
+    i64::from(table_id).rem_euclid(TABLE_WRITE_COUNTS as i64) as usize
+}
+
+pub(crate) struct TableWriteCount {
+    counts: Arc<[AtomicU64; TABLE_WRITE_COUNTS]>,
+    index: usize,
+}
+
+impl TableWriteCount {
+    pub(crate) fn get(&self) -> u64 {
+        self.counts[self.index].load(Ordering::Acquire)
     }
 }
 
@@ -4777,6 +4806,21 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         })
     }
 
+    pub(crate) fn table_write_count(
+        &self,
+        tx_id: TxID,
+        table_id: MVTableId,
+    ) -> Result<TableWriteCount> {
+        let tx = self
+            .txs
+            .get(&tx_id)
+            .ok_or_else(|| LimboError::NoSuchTransactionID(tx_id.to_string()))?;
+        Ok(TableWriteCount {
+            counts: tx.value().table_writes.clone(),
+            index: table_write_index(table_id),
+        })
+    }
+
     /// This transaction's frozen WAL read mark, or [`WalPos::STAGED`] (sees everything published)
     /// if untracked. The physical-reachability coordinate of the btree-read gate. See
     /// [`Self::is_btree_readable_at`].
@@ -5915,6 +5959,47 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         Ok(false)
     }
 
+    pub(crate) fn resolve_cell_with_chain(
+        &self,
+        snapshot: MvccReadSnapshot,
+        versions: &RowVersions<A>,
+    ) -> Result<VisibleRow> {
+        let versions = versions.read();
+        if !self.chain_hides_btree_row(snapshot, &versions)? {
+            return Ok(VisibleRow::Cell);
+        }
+        Ok(match self.find_visible_version(snapshot, &versions)? {
+            Some(version) => VisibleRow::Version(
+                version
+                    .row
+                    .data
+                    .clone()
+                    .expect("a table row version must have a payload"),
+            ),
+            None => VisibleRow::NoRow,
+        })
+    }
+
+    fn chain_hides_btree_row(
+        &self,
+        snapshot: MvccReadSnapshot,
+        versions: &[RowVersion],
+    ) -> Result<bool> {
+        for version in versions.iter().rev() {
+            match version.hides_btree_row_at(snapshot.begin_ts) {
+                Some(true) => return Ok(true),
+                Some(false) => {}
+                None => {
+                    let tx = self.txs.get(&snapshot.tx_id).ok_or_else(|| {
+                        LimboError::NoSuchTransactionID(snapshot.tx_id.to_string())
+                    })?;
+                    return Ok(self.chain_invalidates_btree_row(tx.value(), versions));
+                }
+            }
+        }
+        Ok(false)
+    }
+
     /// Gets all row ids in the database.
     pub fn scan_row_ids(&self) -> Result<Vec<RowID>> {
         tracing::trace!("scan_row_ids");
@@ -6094,9 +6179,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         if self.btree_covers_chain_for_tx(tx, table_id, &versions) {
             return Ok(false);
         }
-        Ok(versions.iter().rev().any(|version| {
-            version.is_btree_invalidating_version(tx, &self.txs, &self.finalized_tx_states)
-        }))
+        Ok(self.chain_invalidates_btree_row(tx, &versions))
     }
 
     /// Check if the B-tree version of a row should be shown to the given transaction.
@@ -6152,13 +6235,13 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         if self.btree_covers_chain_for_tx(tx, table_id, versions) {
             return Ok(true);
         }
+        Ok(!self.chain_invalidates_btree_row(tx, versions))
+    }
 
-        // Check if any version invalidates the B-tree row
-        let btree_is_invalid = versions.iter().rev().any(|version| {
+    fn chain_invalidates_btree_row(&self, tx: &Transaction<A>, versions: &[RowVersion]) -> bool {
+        versions.iter().rev().any(|version| {
             version.is_btree_invalidating_version(tx, &self.txs, &self.finalized_tx_states)
-        });
-
-        Ok(!btree_is_invalid)
+        })
     }
 
     fn find_visible_version<'a>(
@@ -10557,6 +10640,17 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             false
         }
     }
+
+    pub(crate) fn require_readable_transaction(&self, tx_id: TxID) -> Result<()> {
+        let tx = self
+            .txs
+            .get(&tx_id)
+            .ok_or_else(|| LimboError::NoSuchTransactionID(tx_id.to_string()))?;
+        if tx.value().abort_now.load(Ordering::Acquire) {
+            return Err(LimboError::CommitDependencyAborted);
+        }
+        Ok(())
+    }
 }
 
 fn rollback_restores_rowid(tx_id: u64, rv: &RowVersion) -> bool {
@@ -10810,6 +10904,19 @@ impl RowVersion {
             Some(TxTimestampOrID::TxID(_)) => None,
             None => Some(true),
         }
+    }
+
+    fn hides_btree_row_at(&self, begin_ts: u64) -> Option<bool> {
+        if matches!(self.end(), Some(TxTimestampOrID::TxID(_))) {
+            return None;
+        }
+        if self.is_visible_at(begin_ts)? {
+            return Some(true);
+        }
+        Some(matches!(
+            self.end(),
+            Some(TxTimestampOrID::Timestamp(end_ts)) if begin_ts > end_ts
+        ))
     }
 
     /// Check if this version indicates the B-tree row has been modified (updated or deleted).
