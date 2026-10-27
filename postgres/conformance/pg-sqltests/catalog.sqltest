@@ -1180,3 +1180,51 @@ test pg-sequence-reflects-drop {
 expect {
     kept_seq
 }
+
+test pg-primary-key-dump-catalogs {
+    CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT UNIQUE);
+    CREATE SEQUENCE after_indexes;
+    SELECT t.relname, c.conname, i.indkey,
+           CASE WHEN t.relhasindex AND i.indisprimary AND i.indisunique THEN 1 ELSE 0 END,
+           x.relkind, pg_get_constraintdef(c.oid), pg_get_indexdef(i.indexrelid)
+    FROM pg_constraint c JOIN pg_class t ON t.oid = c.conrelid
+    JOIN pg_index i ON i.indexrelid = c.conindid
+    JOIN pg_class x ON x.oid = i.indexrelid
+    WHERE t.relname = 'items' AND c.contype = 'p';
+    SELECT count(*) FROM pg_depend d
+    JOIN pg_constraint c ON d.refobjid = c.oid AND d.refclassid = 2606
+    WHERE c.conname = 'items_pkey' AND d.classid = 1259
+      AND d.objid = c.conindid AND d.deptype = 'i';
+    SELECT CASE WHEN count(*) = count(DISTINCT oid) THEN 1 ELSE 0 END FROM pg_class;
+}
+expect {
+    items|items_pkey|1|1|i|PRIMARY KEY (id)|CREATE UNIQUE INDEX items_pkey ON public.items USING btree (id)
+    1
+    1
+}
+
+test pg-primary-key-with-other-unique-constraint {
+    CREATE TABLE keys (a TEXT UNIQUE, b TEXT, c TEXT, PRIMARY KEY (b, c));
+    SELECT c.contype, i.indkey, CASE WHEN i.indisprimary THEN 1 ELSE 0 END,
+           pg_get_constraintdef(c.oid)
+    FROM pg_constraint c JOIN pg_class t ON t.oid = c.conrelid
+    JOIN pg_index i ON i.indexrelid = c.conindid
+    WHERE t.relname = 'keys' ORDER BY c.contype;
+}
+expect {
+    p|2 3|1|PRIMARY KEY (b, c)
+    u|1|0|UNIQUE (a)
+}
+
+test pg-primary-key-named-and-quoted {
+    CREATE TABLE "quoted table" (payload TEXT, "key column" INTEGER CONSTRAINT "custom key" PRIMARY KEY);
+    SELECT c.conname, i.indkey, pg_get_constraintdef(c.oid), pg_get_indexdef(c.conindid)
+    FROM pg_constraint c JOIN pg_class t ON t.oid = c.conrelid
+    JOIN pg_index i ON i.indexrelid = c.conindid
+    WHERE t.relname = 'quoted table' AND c.contype = 'p';
+    SELECT indexname, indexdef FROM pg_indexes WHERE tablename = 'quoted table';
+}
+expect {
+    custom key|2|PRIMARY KEY ("key column")|CREATE UNIQUE INDEX "custom key" ON public."quoted table" USING btree ("key column")
+    custom key|CREATE UNIQUE INDEX "custom key" ON public."quoted table" USING btree ("key column")
+}
