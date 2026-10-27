@@ -1,6 +1,7 @@
 use super::{cost_params::CostModelParams, AvailableIndexes};
 use crate::alloc::TursoIteratorExt;
 use crate::translate::expr::comparison_affinity;
+use crate::translate::expr::expr_type::{column_type, ExprType};
 use crate::{
     schema::{Column, Index, Schema},
     translate::{
@@ -1259,6 +1260,26 @@ pub fn constraints_from_where_clause(
                 }
                 _ => {}
             }
+            // An index on a column without the custom type's comparison function
+            // would compare the raw values, so its seek could find other rows than
+            // the comparison does.
+            let column_compares_with_function = constrained_column.is_some_and(|column| {
+                column_compares_with_custom_type_function(
+                    column,
+                    table_reference.table.is_strict(),
+                    schema,
+                )
+            });
+            if !column_compares_with_function
+                && compares_with_custom_type_function(
+                    constraint.get_constraining_expr_ref(where_clause),
+                    table_references,
+                    schema,
+                )
+            {
+                constraint.usable = false;
+                continue;
+            }
 
             if constraint.is_rowid
                 || rowid_alias_column.is_some_and(|p| constraint.table_col_pos == Some(p))
@@ -1380,6 +1401,40 @@ pub fn constraints_from_where_clause(
     }
 
     Ok(constraints)
+}
+
+/// Whether an expression is a column whose custom type compares with its own
+/// `=` or `<` function, such as `uuid_eq` or `numeric_lt`. Hash joins and index
+/// seeks on other columns compare the raw values instead, so they can disagree
+/// with that function.
+pub(super) fn compares_with_custom_type_function(
+    expr: &ast::Expr,
+    table_references: &TableReferences,
+    schema: &Schema,
+) -> bool {
+    let ast::Expr::Column { table, column, .. } = expr else {
+        return false;
+    };
+    let Some((_, table)) = table_references.find_table_by_internal_id(*table) else {
+        return false;
+    };
+    table.get_column_at(*column).is_some_and(|column| {
+        column_compares_with_custom_type_function(column, table.is_strict(), schema)
+    })
+}
+
+fn column_compares_with_custom_type_function(
+    column: &Column,
+    is_strict: bool,
+    schema: &Schema,
+) -> bool {
+    matches!(
+        column_type(column, is_strict, schema),
+        ExprType::Custom { type_def, .. } if type_def
+            .operators()
+            .iter()
+            .any(|op| (op.op == "=" || op.op == "<") && op.func_name.is_some())
+    )
 }
 
 /// A reference to a [Constraint]s in a [TableConstraints] for single column.

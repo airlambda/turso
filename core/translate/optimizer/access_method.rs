@@ -11,9 +11,9 @@ use crate::schema::Schema;
 use crate::stats::AnalyzeStats;
 use crate::translate::expr::{as_binary_components, comparison_affinity, walk_expr, WalkControl};
 use crate::translate::optimizer::constraints::{
-    convert_to_vtab_constraint, expr_uses_custom_collation, ordered_ephemeral_key_columns,
-    partial_index, partial_index_predicate_terms, BinaryExprSide, Constraint, ConstraintOperator,
-    RangeConstraintRef,
+    compares_with_custom_type_function, convert_to_vtab_constraint, expr_uses_custom_collation,
+    ordered_ephemeral_key_columns, partial_index, partial_index_predicate_terms, BinaryExprSide,
+    Constraint, ConstraintOperator, RangeConstraintRef,
 };
 use crate::translate::optimizer::cost::{rows_per_leaf_page_for_index, RowCountEstimate};
 use crate::translate::optimizer::cost_params::CostModelParams;
@@ -1241,12 +1241,23 @@ fn one_table_in_expr(expr: &ast::Expr) -> Option<TableInternalId> {
     (!has_more_than_one).then_some(table).flatten()
 }
 
-/// Return the two tables used by one equal test.
-pub(super) fn tables_in_equal_test(expr: &ast::Expr) -> Option<(TableInternalId, TableInternalId)> {
+/// Return the two tables used by one equal test that a hash join can use.
+pub(super) fn tables_in_equal_test(
+    expr: &ast::Expr,
+    table_references: &TableReferences,
+    schema: &Schema,
+) -> Option<(TableInternalId, TableInternalId)> {
     let Ok(Some((left, operator, right))) = as_binary_components(expr) else {
         return None;
     };
     if !matches!(operator.as_ast_operator(), Some(ast::Operator::Equals)) {
+        return None;
+    }
+    // A hash join compares the values themselves, so it would not match what a
+    // custom type's `=` function (such as `numeric_eq`) decides.
+    if compares_with_custom_type_function(left, table_references, schema)
+        || compares_with_custom_type_function(right, table_references, schema)
+    {
         return None;
     }
     Some((one_table_in_expr(left)?, one_table_in_expr(right)?))
