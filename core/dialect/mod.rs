@@ -226,13 +226,11 @@ pub trait Dialect: Send + Sync + 'static {
         false
     }
 
-    /// Whether an error inside an explicit transaction rolls back the whole
-    /// transaction when the failed statement has no statement journal.
+    /// Whether any error inside an explicit transaction rolls back the whole
+    /// transaction, not only the failed statement.
     ///
-    /// SQLite keeps the transaction open. Such a statement can still fail
-    /// after writing, for example a multi-row INSERT that divides by zero in
-    /// PostgreSQL, and PostgreSQL keeps nothing from a transaction once a
-    /// statement in it fails.
+    /// SQLite keeps the transaction open. PostgreSQL keeps nothing from a
+    /// transaction once a statement in it fails.
     fn statement_error_rolls_back_transaction(&self) -> bool {
         false
     }

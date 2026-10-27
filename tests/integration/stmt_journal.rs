@@ -930,3 +930,45 @@ fn returning_error_in_tx_rolls_back_only_the_statement(tmp_db: TempDatabase) -> 
     }
     Ok(())
 }
+
+/// As in SQLite, an I/O error ends the whole explicit transaction, even when
+/// the failed statement has a statement journal that could undo only itself.
+#[test]
+fn io_error_in_tx_rolls_back_transaction_with_stmt_journal() -> anyhow::Result<()> {
+    use crate::queued_io::{QueuedIo, QueuedIoOpKind};
+    use turso_core::{ConnectOpts, Database, DatabaseOpts, OpenFlags, SqliteDialect};
+
+    let io = Arc::new(QueuedIo::new());
+    let db_path = "stmt-journal-io-error.db";
+    let db = Database::open_file_with_flags(
+        io.clone(),
+        db_path,
+        OpenFlags::default(),
+        DatabaseOpts::new(),
+        None,
+        Arc::new(SqliteDialect),
+    )?;
+    let setup = db.connect(ConnectOpts::new())?;
+    setup.execute("CREATE TABLE s (x)")?;
+    setup.execute("CREATE TABLE t (x NOT NULL)")?;
+    setup.execute("INSERT INTO s SELECT randomblob(1000) FROM generate_series(1, 200)")?;
+    setup.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+    setup.close()?;
+
+    let conn = db.connect(ConnectOpts::new())?;
+    conn.execute("BEGIN")?;
+    conn.execute("INSERT INTO t VALUES (1)")?;
+    let failing = "INSERT INTO t SELECT x FROM s";
+    assert!(needs_stmt_journal(&conn, failing));
+    io.fault_after(db_path, QueuedIoOpKind::Pread, 0);
+    let err = conn.execute(failing).expect_err(failing);
+    io.clear_fault();
+    assert!(
+        matches!(err, turso_core::LimboError::CompletionError(_)),
+        "{err}"
+    );
+
+    assert!(conn.get_auto_commit(), "the transaction should have ended");
+    assert_eq!(query_rows(&conn, "SELECT count(*) FROM t"), vec!["0"]);
+    Ok(())
+}
