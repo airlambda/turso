@@ -2486,8 +2486,10 @@ impl ProgramBuilder {
         // abort midway (e.g. constraint violation). Single-row writes are atomic and don't
         // need statement-level rollback. Both flags default to true; specific translate paths
         // (e.g., single-row INSERT) set is_multi_write=false to opt out.
+        // RETURNING values are computed after the row is written (SQLite codes
+        // RETURNING as a trigger), so a write that returns rows is a multi-write.
         let needs_stmt_subtransactions = matches!(self.txn_mode, TransactionMode::Write)
-            && self.flags.is_multi_write()
+            && (self.flags.is_multi_write() || !self.result_columns.is_empty())
             && self.may_abort();
 
         let prepared = PreparedProgram {

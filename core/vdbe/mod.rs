@@ -3862,8 +3862,28 @@ impl Program {
                         }
                     }
                     TxnCleanup::None => {
+                        // As in SQLite, an error inside an explicit transaction
+                        // ends only the failed statement, and a statement
+                        // without a statement journal is not undone. Storage
+                        // errors (I/O error, disk full, out of memory) roll
+                        // back the whole transaction.
+                        let storage_failed = matches!(
+                            err,
+                            Some(
+                                LimboError::CompletionError(_)
+                                    | LimboError::CacheError(_)
+                                    | LimboError::DatabaseFull
+                                    | LimboError::OutOfMemory
+                            )
+                        );
+                        let rollback_explicit_txn = err.is_some()
+                            && (storage_failed
+                                || self
+                                    .connection
+                                    .dialect()
+                                    .statement_error_rolls_back_transaction());
                         if can_autocommit_now
-                            || (!self.connection.get_auto_commit() && err.is_some())
+                            || (inside_explicit_transaction && rollback_explicit_txn)
                         {
                             self.rollback_current_txn(pager);
                         }

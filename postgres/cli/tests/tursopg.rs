@@ -2117,6 +2117,29 @@ fn wire_error_division_by_zero() {
     });
 }
 
+/// A multi-row INSERT with no statement journal fails on its second row after
+/// writing the first. PostgreSQL commits nothing from that transaction, so
+/// neither the row written before the error nor the failed statement's first
+/// row may survive.
+#[test]
+fn division_by_zero_in_transaction_keeps_no_rows() {
+    with_pg_client(|c| {
+        c.query_command_tags("CREATE TABLE t (x int)");
+        c.query_command_tags("CREATE TABLE s (y int)");
+        c.query_command_tags("INSERT INTO s VALUES (1), (0)");
+        c.query_command_tags("BEGIN");
+        c.query_command_tags("INSERT INTO t VALUES (5)");
+        let fields = c.query_error_fields("INSERT INTO t SELECT 10 / y FROM s");
+        assert_eq!(
+            fields.get(&b'C').map(String::as_str),
+            Some("22012"),
+            "division by zero must be SQLSTATE 22012, got: {fields:?}"
+        );
+        c.query_error_fields("COMMIT");
+        assert_eq!(c.query_single_text("SELECT count(*) FROM t"), "0");
+    });
+}
+
 /// `SELECT NULL / 0` returns NULL (not an error) in both PostgreSQL and Turso.
 #[test]
 fn null_divided_by_zero_is_null() {

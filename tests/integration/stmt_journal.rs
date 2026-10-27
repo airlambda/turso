@@ -850,3 +850,83 @@ fn upsert_or_replace_do_update_unique_failure_no_index_corruption(
     );
     Ok(())
 }
+
+// ──────────────────────────────────────────────────────────
+// Regression: run-time errors inside an explicit transaction
+// ──────────────────────────────────────────────────────────
+
+/// Like SQLite, a run-time error inside BEGIN ends only the failed statement:
+/// the transaction stays open and COMMIT keeps the rows written before and
+/// after the error. The INSERT fails before it writes anything, and it has no
+/// statement journal.
+#[turso_macros::test(init_sql = "CREATE TABLE t (x);")]
+fn runtime_error_in_tx_keeps_transaction(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    for failing in [
+        "SELECT abs(-9223372036854775807 - 1)",
+        "INSERT INTO t VALUES (abs(-9223372036854775807 - 1))",
+    ] {
+        conn.execute("DELETE FROM t")?;
+        conn.execute("BEGIN")?;
+        conn.execute("INSERT INTO t VALUES (1)")?;
+        let err = conn.execute(failing).expect_err(failing);
+        assert!(
+            matches!(err, turso_core::LimboError::IntegerOverflow),
+            "{failing}: {err}"
+        );
+        conn.execute("INSERT INTO t VALUES (2)")?;
+        conn.execute("COMMIT")?;
+        assert_eq!(
+            query_rows(&conn, "SELECT x FROM t ORDER BY x"),
+            vec!["1", "2"],
+            "{failing}"
+        );
+    }
+    Ok(())
+}
+
+/// RETURNING values are computed after the row is written, so a single-row
+/// write with a RETURNING expression that can fail needs a statement journal,
+/// as in SQLite, where RETURNING is coded as a trigger.
+#[turso_macros::test(init_sql = "CREATE TABLE t (x);")]
+fn single_row_write_with_returning_needs_stmt_journal(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    assert!(!needs_stmt_journal(&conn, "INSERT INTO t VALUES (1)"));
+    for sql in [
+        "INSERT INTO t VALUES (1) RETURNING abs(x)",
+        "UPDATE t SET x = 1 WHERE rowid = 1 RETURNING abs(x)",
+        "DELETE FROM t WHERE rowid = 1 RETURNING abs(x)",
+    ] {
+        assert!(needs_stmt_journal(&conn, sql), "{sql}");
+    }
+    Ok(())
+}
+
+/// A RETURNING expression that fails after the row was written must undo
+/// that write and leave the rest of the transaction in place.
+#[turso_macros::test(init_sql = "CREATE TABLE t (x);")]
+fn returning_error_in_tx_rolls_back_only_the_statement(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    for failing in [
+        "INSERT INTO t VALUES (-9223372036854775807 - 1) RETURNING abs(x)",
+        "UPDATE t SET x = -9223372036854775807 - 1 WHERE x = 1 RETURNING abs(x)",
+        "DELETE FROM t WHERE x = 1 RETURNING abs(x - 9223372036854775807 - 2)",
+    ] {
+        conn.execute("DELETE FROM t")?;
+        conn.execute("BEGIN")?;
+        conn.execute("INSERT INTO t VALUES (1)")?;
+        let err = conn.execute(failing).expect_err(failing);
+        assert!(
+            matches!(err, turso_core::LimboError::IntegerOverflow),
+            "{failing}: {err}"
+        );
+        conn.execute("INSERT INTO t VALUES (2)")?;
+        conn.execute("COMMIT")?;
+        assert_eq!(
+            query_rows(&conn, "SELECT x FROM t ORDER BY x"),
+            vec!["1", "2"],
+            "{failing}"
+        );
+    }
+    Ok(())
+}

@@ -225,6 +225,17 @@ pub trait Dialect: Send + Sync + 'static {
     fn add_column_computes_default_for_existing_rows(&self) -> bool {
         false
     }
+
+    /// Whether an error inside an explicit transaction rolls back the whole
+    /// transaction when the failed statement has no statement journal.
+    ///
+    /// SQLite keeps the transaction open. Such a statement can still fail
+    /// after writing, for example a multi-row INSERT that divides by zero in
+    /// PostgreSQL, and PostgreSQL keeps nothing from a transaction once a
+    /// statement in it fails.
+    fn statement_error_rolls_back_transaction(&self) -> bool {
+        false
+    }
 }
 
 #[cfg(test)]

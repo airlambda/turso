@@ -194,6 +194,13 @@ impl Dialect for PostgresDialect {
         true
     }
 
+    // PostgreSQL keeps a failed transaction open until ROLLBACK and then
+    // discards it. Turso has no failed transaction state yet, so it rolls the
+    // transaction back right away.
+    fn statement_error_rolls_back_transaction(&self) -> bool {
+        true
+    }
+
     fn mod_of_integers_is_integer(&self) -> bool {
         true
     }
